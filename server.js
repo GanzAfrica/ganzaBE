@@ -1,13 +1,13 @@
 const express = require('express');
-const mysql = require('mysql2');
+const { Pool } = require('pg');
 const cors = require('cors');
 const multer = require('multer');
 const fs = require('fs');
-const xlsx = require('xlsx'); // For handling Excel files
-require('dotenv').config(); // For loading environment variables
+const xlsx = require('xlsx');
+require('dotenv').config();
 
 const app = express();
-const port = process.env.PORT || 5000; // Use environment variable or default to 5000
+const port = process.env.PORT || 5000;
 
 app.use(cors());
 app.use(express.json());
@@ -15,174 +15,186 @@ app.use(express.json());
 // Configure multer for file uploads
 const upload = multer({ dest: 'uploads/' });
 
-// Create a MySQL connection pool
-const pool = mysql.createPool({
-  connectionLimit: 10, // Set the maximum number of connections in the pool
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME
+// Create a PostgreSQL connection pool
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    require: true,
+    rejectUnauthorized: false
+  }
 });
 
 // Test the connection
-pool.getConnection((err, connection) => {
-  if (err) {
-    console.error('Database connection error:', err);
-    return;
-  }
-  console.log('Connected to the MySQL database.');
-  connection.release(); // Release the connection back to the pool
-});
+pool.connect()
+  .then(client => {
+    console.log('Connected to PostgreSQL database');
+    client.release();
+  })
+  .catch(err => console.error('Database connection error:', err));
 
 // Route to get all table names
-app.get('/tables', (req, res) => {
-  pool.query("SHOW TABLES", (err, results) => {
-    if (err) {
-      console.error('Error fetching table names:', err);
-      return res.status(500).send('Error fetching table names');
-    }
-    const tables = results.map(row => Object.values(row)[0]);
+app.get('/tables', async (req, res) => {
+  try {
+    const query = `
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+    `;
+    const { rows } = await pool.query(query);
+    const tables = rows.map(row => row.table_name);
     res.json(tables);
-  });
+  } catch (err) {
+    console.error('Error fetching table names:', err);
+    res.status(500).send('Error fetching table names');
+  }
 });
 
 // Route to get data from a specific table
-app.get('/table-data/:tableName', (req, res) => {
+app.get('/table-data/:tableName', async (req, res) => {
   const tableName = req.params.tableName;
-
-  pool.query(`SELECT * FROM ${mysql.escapeId(tableName)}`, (err, results) => {
-    if (err) {
-      console.error(`Error fetching data from ${tableName}:`, err);
-      return res.status(500).send(`Error fetching data from ${tableName}`);
-    }
-    res.json(results);
-  });
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM $1:name',
+      [tableName]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(`Error fetching data from ${tableName}:`, err);
+    res.status(500).send(`Error fetching data from ${tableName}`);
+  }
 });
 
 // Route to create a new table
-app.post('/create-table', (req, res) => {
+app.post('/create-table', async (req, res) => {
   const { tableName, columns } = req.body;
 
   if (!tableName || !columns || !Array.isArray(columns)) {
     return res.status(400).send('Table name and columns are required');
   }
 
-  const columnsDefinition = columns.map(col => `${mysql.escapeId(col.name)} ${col.type}`).join(', ');
-  const query = `CREATE TABLE IF NOT EXISTS ${mysql.escapeId(tableName)} (${columnsDefinition})`;
+  try {
+    const columnsDefinition = columns
+      .map(col => `"${col.name}" ${col.type}`)
+      .join(', ');
+    const query = `CREATE TABLE IF NOT EXISTS "${tableName}" (${columnsDefinition})`;
 
-  pool.query(query, (err, results) => {
-    if (err) {
-      console.error(`Error creating table ${tableName}:`, err);
-      return res.status(500).send(`Error creating table ${tableName}`);
-    }
+    await pool.query(query);
     res.status(201).send(`Table ${tableName} created successfully`);
-  });
+  } catch (err) {
+    console.error(`Error creating table ${tableName}:`, err);
+    res.status(500).send(`Error creating table ${tableName}`);
+  }
 });
 
 // Route to delete a table
-app.delete('/delete-table/:tableName', (req, res) => {
+app.delete('/delete-table/:tableName', async (req, res) => {
   const tableName = req.params.tableName;
 
   if (!tableName) {
     return res.status(400).send('Table name is required');
   }
 
-  const query = `DROP TABLE IF EXISTS ${mysql.escapeId(tableName)}`;
-
-  pool.query(query, (err, results) => {
-    if (err) {
-      console.error(`Error deleting table ${tableName}:`, err);
-      return res.status(500).send(`Error deleting table ${tableName}`);
-    }
+  try {
+    await pool.query('DROP TABLE IF EXISTS $1:name', [tableName]);
     res.send(`Table ${tableName} deleted successfully`);
-  });
+  } catch (err) {
+    console.error(`Error deleting table ${tableName}:`, err);
+    res.status(500).send(`Error deleting table ${tableName}`);
+  }
 });
 
 // Route to update data in a table
-app.put('/update-table/:tableName', (req, res) => {
+app.put('/update-table/:tableName', async (req, res) => {
   const tableName = req.params.tableName;
-  const data = req.body; // Expecting an array of objects
+  const data = req.body;
 
   if (!Array.isArray(data) || data.length === 0) {
     return res.status(400).send('Invalid data format.');
   }
 
-  pool.getConnection((err, connection) => {
-    if (err) return res.status(500).send('Error connecting to the database');
+  const client = await pool.connect();
 
-    connection.beginTransaction((err) => {
-      if (err) return connection.rollback(() => res.status(500).send('Error starting transaction'));
+  try {
+    await client.query('BEGIN');
 
-      let queriesCompleted = 0;
+    for (const row of data) {
+      const uniqueColumns = Object.keys(row).filter(col => col !== 'updateField');
+      const updateFields = Object.keys(row).filter(col => col === 'updateField');
 
-      data.forEach(row => {
-        const uniqueColumns = Object.keys(row).filter(col => col !== 'updateField');
-        const updateFields = Object.keys(row).filter(col => col === 'updateField');
-        
-        if (uniqueColumns.length === 0 || updateFields.length === 0) {
-          return res.status(400).send('No unique columns or update fields specified.');
-        }
+      if (uniqueColumns.length === 0 || updateFields.length === 0) {
+        throw new Error('No unique columns or update fields specified.');
+      }
 
-        const conditions = uniqueColumns.map(col => `${mysql.escapeId(col)} = ?`).join(' AND ');
-        const updates = updateFields.map(col => `${mysql.escapeId(col)} = ?`).join(', ');
-        const values = [...uniqueColumns.map(col => row[col]), ...updateFields.map(col => row[col])];
-        
-        const query = `UPDATE ${mysql.escapeId(tableName)} SET ${updates} WHERE ${conditions}`;
-        connection.query(query, values, (err) => {
-          if (err) {
-            console.error('Error updating row:', err);
-            return connection.rollback(() => res.status(500).send('Error updating table data'));
-          }
+      const conditions = uniqueColumns.map((col, idx) => `"${col}" = $${idx + 1}`).join(' AND ');
+      const updates = updateFields.map((col, idx) =>
+        `"${col}" = $${uniqueColumns.length + idx + 1}`
+      ).join(', ');
 
-          queriesCompleted++;
-          if (queriesCompleted === data.length) {
-            connection.commit((err) => {
-              if (err) {
-                console.error('Error committing transaction:', err);
-                return connection.rollback(() => res.status(500).send('Error updating table data'));
-              }
-              connection.release();
-              res.send('Table data updated successfully');
-            });
-          }
-        });
-      });
-    });
-  });
+      const values = [
+        ...uniqueColumns.map(col => row[col]),
+        ...updateFields.map(col => row[col])
+      ];
+
+      const query = `
+        UPDATE "${tableName}"
+        SET ${updates}
+        WHERE ${conditions}
+      `;
+
+      await client.query(query, values);
+    }
+
+    await client.query('COMMIT');
+    res.send('Table data updated successfully');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error updating table data:', err);
+    res.status(500).send('Error updating table data');
+  } finally {
+    client.release();
+  }
 });
 
-// Route to upload data to a table from Excel file
 // Route to upload data to a specific table
 app.post('/upload/:tableName', async (req, res) => {
   const { tableName } = req.params;
-  const { data } = req.body; // This is the parsed CSV data
+  const { data } = req.body;
 
   if (!data || !data.length) {
-      return res.status(400).send('No data to upload.');
+    return res.status(400).send('No data to upload.');
   }
 
-  const connection = await pool.getConnection();
+  const client = await pool.connect();
 
   try {
-      // Construct the SQL query for inserting data
-      const keys = Object.keys(data[0]);
-      const values = data.map(row => keys.map(key => row[key]));
-      const placeholders = values.map(() => `(${keys.map(() => '?').join(',')})`).join(',');
+    await client.query('BEGIN');
 
-      const sql = `INSERT INTO ${tableName} (${keys.join(',')}) VALUES ${placeholders}`;
-      
-      await connection.query(sql, values.flat());
-      res.status(200).send('Data uploaded successfully!');
+    const keys = Object.keys(data[0]);
+    const columns = keys.map(key => `"${key}"`).join(',');
+
+    for (const row of data) {
+      const values = keys.map(key => row[key]);
+      const placeholders = keys.map((_, idx) => `$${idx + 1}`).join(',');
+
+      const query = `
+        INSERT INTO "${tableName}" (${columns})
+        VALUES (${placeholders})
+      `;
+
+      await client.query(query, values);
+    }
+
+    await client.query('COMMIT');
+    res.status(200).send('Data uploaded successfully!');
   } catch (error) {
-      console.error('Error uploading data:', error);
-      res.status(500).send('Failed to upload data.');
+    await client.query('ROLLBACK');
+    console.error('Error uploading data:', error);
+    res.status(500).send('Failed to upload data.');
   } finally {
-      connection.release();
+    client.release();
   }
 });
 
-
-// Start the server
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 });
